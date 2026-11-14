@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>UnrEal 账号商店</title>
+<link rel="icon" href="assets/logo-small.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 登录门 -->
+<div class="login-overlay" id="login-overlay">
+  <div class="login-box">
+    <img class="login-logo" src="assets/logo.png" alt="UnrEal">
+    <div class="login-title">UnrEal 账号商店</div>
+    <div class="login-sub">请输入访问密码</div>
+    <input type="password" id="login-pass" placeholder="访问密码" autocomplete="off">
+    <button class="solid login-btn" id="login-btn">进入</button>
+    <div class="login-err" id="login-err"></div>
+  </div>
+</div>
+
+<header class="topbar">
+  <div class="bar-main">
+    <div class="bar-side">
+      <img class="brand-logo" src="assets/logo.png" alt="UnrEal">
+      <div class="bar-left">当前筛选总数：<b id="total">0</b><span class="role-badge" id="role-badge" hidden></span></div>
+    </div>
+    <div class="bar-right">
+      <button class="bar-btn boss-only" id="btn-export-enc" hidden>导出加密包</button>
+      <button class="bar-btn boss-only" id="btn-export-staff" hidden>导出员工包</button>
+      <button class="bar-btn boss-only" id="btn-staff-keys" hidden>员工密码</button>
+      <button class="bar-btn" id="btn-import">导入数据</button>
+      <button class="bar-btn" id="btn-filter">筛选</button>
+      <button class="bar-btn" id="btn-logout" hidden>退出</button>
+    </div>
+  </div>
+  <div class="bar-sub">
+    <span id="filter-label">当前筛选：全部账号</span>
+    <span class="db-status" id="db-status">皮肤库加载中…</span>
+  </div>
+</header>
+
+<div class="toolbar">
+  <div class="search-wrap">
+    <svg class="search-ico" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M16.5 16.5 L21 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <input id="q" type="search" placeholder="搜索编号 / 皮肤名" autocomplete="off">
+  </div>
+  <button class="tool-btn" id="btn-clear">清空数据</button>
+</div>
+
+<main class="list" id="list"></main>
+
+<div class="empty" id="empty">
+  <div class="empty-box">
+    <div class="empty-title">还没有数据</div>
+    <div class="empty-sub">把 Excel / CSV / JSON 拖进来，或点下面的按钮</div>
+    <button class="solid big" id="empty-import">导入数据</button>
+    <div class="empty-tip">支持账密表、查询结果表；第一行有表头会自动识别，没有表头按「账号 / 密码 / 邮箱 / 邮箱密码」顺序读</div>
+  </div>
+</div>
+
+<div class="more" id="more" hidden><button class="ghost" id="more-btn">加载更多</button></div>
+
+<!-- 筛选面板 -->
+<div class="overlay" id="filter-overlay">
+  <div class="panel">
+    <div class="panel-head">
+      <h3>筛选</h3>
+      <button class="x" data-close>×</button>
+    </div>
+    <div class="panel-body">
+      <div class="group">
+        <label>范围</label>
+        <div class="chips" id="f-scope">
+          <button class="chip on" data-v="all">全部账号</button>
+          <button class="chip" data-v="has">有每日商店</button>
+          <button class="chip" data-v="night">有夜市</button>
+          <button class="chip" data-v="empty">无皮肤数据</button>
+        </div>
+      </div>
+      <div class="group">
+        <label>排序</label>
+        <div class="chips" id="f-sort">
+          <button class="chip on" data-v="id-asc">编号升序</button>
+          <button class="chip" data-v="id-desc">编号降序</button>
+          <button class="chip" data-v="skins-desc">皮肤多 → 少</button>
+        </div>
+      </div>
+    </div>
+    <div class="panel-foot">
+      <button class="ghost" id="f-reset">重置</button>
+      <button class="solid" data-close>完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- 员工密码管理（老板专用） -->
+<div class="overlay" id="staffkeys-overlay">
+  <div class="panel">
+    <div class="panel-head">
+      <h3>员工密码管理</h3>
+      <button class="x" data-close>×</button>
+    </div>
+    <div class="panel-body">
+      <div class="group">
+        <label>员工密码列表（每个员工一个密码，可加备注；功能完全一样）</label>
+        <ul class="sk-list" id="sk-list"></ul>
+        <div class="sk-addrow">
+          <input id="sk-note" type="text" placeholder="备注，如 张三" autocomplete="off">
+          <input id="sk-input" type="text" placeholder="员工密码" autocomplete="off">
+          <button class="solid" id="sk-add">添加</button>
+        </div>
+        <div class="sk-tip">员工密码全部由老板设置，没设置之前员工无法登录。新密码在你电脑上立即生效；要让员工那边也生效，点「导出员工包」，把新的 data-staff.json 发回来重新发布。</div>
+      </div>
+    </div>
+    <div class="panel-foot">
+      <button class="ghost" id="sk-restore">清空全部</button>
+      <button class="solid" data-close>完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- 商店图片 -->
+<div class="overlay shot" id="shot-overlay">
+  <div class="shot-sheet">
+    <div class="shot-head">
+      <div class="shot-line1" id="shot-title"></div>
+      <div class="shot-line2">下单后将本页截图或编号发给客服即可</div>
+    </div>
+    <div class="shot-body">
+      <h4>每日商店</h4>
+      <div class="tiles" id="shot-daily"></div>
+      <h4 id="shot-night-title" hidden>夜市</h4>
+      <div class="tiles" id="shot-night"></div>
+      <div class="night-empty" id="shot-night-empty">夜市未开放</div>
+    </div>
+    <div class="shot-foot">
+      <button class="ghost" id="shot-copy">复制</button>
+      <button class="solid" data-close>关闭</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="file" accept=".xlsx,.xls,.csv,.txt,.json" hidden>
+<div class="drop-hint" id="drop-hint">松手导入 Excel / CSV / JSON</div>
+<div class="toast" id="toast"></div>
+
+<script src="assets/xlsx.full.min.js"></script>
+<script src="assets/skins-seed.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
