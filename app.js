@@ -66,6 +66,7 @@ let staffName = '';         // 当前员工登录用的密码对应的备注
 let dataDate = '';          // 当前这批每日商店数据属于哪一天；与今天不同 = 已过期（整表清空）
 let cloudDataDate = '';      // 云端数据包的上传日期（dataUpdated 派生），清过缓存的设备也能正确判断过期
 let lastSyncStamp = '';      // 本机最后一次同步时的云端 dataUpdated，用于检测云端有新上传
+const APP_VER = '20261115k'; // 页面代码版本（与 index.html 里 app.js?v= 一致），同步状态条会显示，用于排查设备缓存
 
 async function apiSync(path, body, authHex) {
   const opt = { cache: 'no-store' };
@@ -642,6 +643,7 @@ function render(reset = true) {
   }
   state.view = computeView();
   $('#total').textContent = state.view.length;
+  updateSyncStatus();
   const q = state.q.trim();
   $('#filter-label').textContent = '当前筛选：' + SCOPE_LABEL[state.scope] + (q ? ` · 搜索「${q}」` : '');
 
@@ -1280,6 +1282,19 @@ function rowsFromRecordsSkinOnly(list) {
   watchCloudUpdate();
 })();
 
+/* 同步状态条：让每台设备都能自证「跑的是什么版本 / 本机多少数据 / 云端最后更新」，
+   排查「某台设备没同步」时看一眼就知道卡在哪层。点击状态条 = 立即手动检查一次 */
+function updateSyncStatus() {
+  const el = $('#sync-status');
+  if (!el) return;
+  if (!state.role) { el.hidden = true; return; }
+  el.hidden = false;
+  const n = state.records.length;
+  const withData = state.records.filter((r) => r.daily.length || r.night.length).length;
+  const cloudT = lastSyncStamp ? lastSyncStamp.slice(5, 16).replace('T', ' ') : '未知';
+  el.textContent = `代码 v${APP_VER} · 本机 ${n} 账号（${withData} 带商店数据）· 云端更新 ${cloudT}`;
+}
+
 /* 所有角色自动跟随云端：每 15 秒 + 切回前台 + 启动时查一次 dataUpdated，
    云端有新上传就自动拉最新数据，已登录的设备不用重新登录、不用刷新页面 */
 function watchCloudUpdate() {
@@ -1299,10 +1314,13 @@ function watchCloudUpdate() {
         toast('云端已上传新数据，本页已自动同步最新');
       }
     } catch (e) { /* 云端不可达，静默重试 */ }
+    updateSyncStatus();
   };
   check();
   setInterval(check, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
+  const el = $('#sync-status');
+  if (el) el.addEventListener('click', check);
 }
 
 /* 页面一直开着也要在过 0 点时自动清空：每 20 秒对一次日期，切回前台也查一次 */
