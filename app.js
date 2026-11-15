@@ -65,6 +65,7 @@ let cloudStaffKeys = [];    // 云端的 {h, n} 列表：哈希 + 备注（员�
 let staffName = '';         // 当前员工登录用的密码对应的备注
 let dataDate = '';          // 当前这批每日商店数据属于哪一天；与今天不同 = 已过期（整表清空）
 let cloudDataDate = '';      // 云端数据包的上传日期（dataUpdated 派生），清过缓存的设备也能正确判断过期
+let lastSyncStamp = '';      // 本机最后一次同步时的云端 dataUpdated，用于检测云端有新上传
 
 async function apiSync(path, body, authHex) {
   const opt = { cache: 'no-store' };
@@ -103,7 +104,7 @@ async function bossCloudUpload(allowEmpty) {
       })),
     };
     const r = await apiSync('/boss/upload', { enc, staff, allowEmpty: !!allowEmpty }, auth);
-    toast('已同步到云端（' + r.updated.slice(0, 16).replace('T', ' ') + '），员工下次登录即可看到最新数据');
+    toast('已同步到云端（' + r.updated.slice(0, 16).replace('T', ' ') + '），所有设备将在 30 秒内自动收到最新数据');
   } catch (e) {
     toast('云端同步失败：' + (e.message || e) + '（本机数据已保存）');
   }
@@ -1225,7 +1226,7 @@ function rowsFromRecordsSkinOnly(list) {
     try {
       const cfg = await apiSync('/config');
       if (cfg.bossSalt) bossSalt = cfg.bossSalt;
-      if (cfg.dataUpdated) cloudDataDate = String(cfg.dataUpdated).slice(0, 10);
+      if (cfg.dataUpdated) { cloudDataDate = String(cfg.dataUpdated).slice(0, 10); lastSyncStamp = String(cfg.dataUpdated); }
       if (Array.isArray(cfg.staffKeys)) {
         cloudStaffKeys = cfg.staffKeys
           .filter((k) => k && typeof k.h === 'string')
@@ -1274,7 +1275,32 @@ function rowsFromRecordsSkinOnly(list) {
   render();
   initSkinDB();
   watchDayChange();
+  watchCloudUpdate();
 })();
+
+/* 员工端自动跟随云端：每 30 秒 + 切回前台时查一次 dataUpdated，云端有新上传就自动拉最新数据，
+   已登录的设备不用重新登录、不用刷新页面 */
+function watchCloudUpdate() {
+  if (location.protocol === 'file:') return;
+  const check = async () => {
+    if (state.role !== 'staff') return;
+    try {
+      const r = await fetch('api/config', { cache: 'no-store' });
+      if (!r.ok) return;
+      const cfg = await r.json();
+      if (cfg.dataUpdated && cfg.dataUpdated !== lastSyncStamp) {
+        lastSyncStamp = String(cfg.dataUpdated);
+        if (cfg.dataUpdated) cloudDataDate = String(cfg.dataUpdated).slice(0, 10);
+        await syncStaff();
+        state.shown = 0;
+        render();
+        toast('老板已上传新数据，已自动同步最新');
+      }
+    } catch (e) { /* 云端不可达，静默重试 */ }
+  };
+  setInterval(check, 30000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
+}
 
 /* 页面一直开着也要在过 0 点时自动清空：每 20 秒对一次日期，切回前台也查一次 */
 function watchDayChange() {
