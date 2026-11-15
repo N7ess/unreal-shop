@@ -1,4 +1,4 @@
-/* UnrEal 账号商店 — 前端逻辑
+/* UnrEal 初始号 — 前端逻辑
  * 数据全部存浏览器 localStorage，不上传任何服务器。
  * 皮肤图片走 valorant-api 官方 CDN，名字→图片的映射离线内置一份。
  */
@@ -7,6 +7,9 @@ const LS_DATA = 'unreal_shop_data_v1';
 const LS_DB = 'unreal_shop_db_v1';
 const LS_ROLE = 'unreal_shop_role_v1';
 const LS_STAFF_PASSES = 'unreal_shop_staff_passes_v1'; // 老板设备上的员工密码明文清单（仅本机）
+const LS_REMEMBER = 'unreal_shop_remember_v1'; // 记住密码（仅存本机 localStorage，勾选后下次自动登录）
+const LS_STAFF_NAME = 'unreal_shop_staff_name_v1'; // 当前员工备注（用于顶栏徽章显示）
+const LS_DATA_DATE = 'unreal_shop_data_date_v1'; // 每日商店数据所属日期（YYYY-MM-DD），过了凌晨 0 点自动失效
 const DB_TTL = 7 * 24 * 3600 * 1000;
 const PAGE = 80;
 
@@ -50,6 +53,111 @@ async function encryptPayload(pass, obj) {
   const pt = new TextEncoder().encode(JSON.stringify(obj));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, pt));
   return { v: 1, kdf: 'PBKDF2-SHA256-' + ENC_ITER, salt: saltB64, iv: ivB64, ct: b64(ct) };
+}
+
+/* ---- 云端同步（网站自带 /api 接口，Cloudflare Pages Function + KV）----
+ * 老板上传数据 / 增删员工密码 → 立即写进云端仓库；
+ * 员工登录 → 自动从云端拉最新数据与密码哈希。
+ * 老板身份验证：浏览器里用老板密码派生一个令牌（PBKDF2），服务器只存令牌，密码永不上传。 */
+let bossSalt = '';          // 服务端下发的盐值（公开）
+let cloudStaffHashes = [];  // 云端生效的员工密码哈希（老板面板增删改都以它为准同步）
+let cloudStaffKeys = [];    // 云端的 {h, n} 列表：哈希 + 备注（员工登录后徽章显示自己的备注）
+let staffName = '';         // 当前员工登录用的密码对应的备注
+let dataDate = '';          // 当前这批每日商店数据属于哪一天；与今天不同 = 已过期（整表清空）
+let cloudDataDate = '';      // 云端数据包的上传日期（dataUpdated 派生），清过缓存的设备也能正确判断过期
+
+async function apiSync(path, body, authHex) {
+  const opt = { cache: 'no-store' };
+  if (body) {
+    opt.method = 'POST';
+    opt.headers = { 'Content-Type': 'application/json' };
+    opt.body = JSON.stringify(body);
+  }
+  if (authHex) { opt.headers = Object.assign(opt.headers || {}, { 'X-Auth': authHex }); }
+  const res = await fetch('api' + path, opt);
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((j && j.error) || ('HTTP ' + res.status));
+  return j;
+}
+
+async function syncAuthHex(pass) {
+  if (!bossSalt) return '';
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: new TextEncoder().encode('unreal-sync-' + bossSalt), iterations: ENC_ITER, hash: 'SHA-256' },
+    base, 256);
+  return [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function bossCloudUpload(allowEmpty) {
+  if (location.protocol === 'file:' || !bossSalt) return;
+  if (!BOSS_PASS) { toast('请先退出登录，再用老板密码重新登录一次（刷新后密码不保留），才能同步云端'); return; }
+  try {
+    const auth = await syncAuthHex(BOSS_PASS);
+    const enc = await encryptPayload(BOSS_PASS, rowsFromRecords());
+    const staff = {
+      date: dataDate || dayKey(),
+      records: state.records.map((r) => ({
+        账号: r.id, 皮肤: rowsFromRecordsSkinOnly(r.daily), 夜市: rowsFromRecordsSkinOnly(r.night), 地区: r.region,
+      })),
+    };
+    const r = await apiSync('/boss/upload', { enc, staff, allowEmpty: !!allowEmpty }, auth);
+    toast('已同步到云端（' + r.updated.slice(0, 16).replace('T', ' ') + '），员工下次登录即可看到最新数据');
+  } catch (e) {
+    toast('云端同步失败：' + (e.message || e) + '（本机数据已保存）');
+  }
+}
+
+async function syncStaffKeysToCloud(msg, allowEmpty) {
+  if (location.protocol === 'file:' || !bossSalt) return;
+  if (!BOSS_PASS) { toast('请先退出登录，再用老板密码重新登录一次，员工密码才能同步到云端'); return; }
+  try {
+    const auth = await syncAuthHex(BOSS_PASS);
+    /* 本机清单（带备注）+ 云端已有 的并集一起同步：换设备也能一键找回全部员工密码 */
+    const map = new Map();
+    (cloudStaffKeys || []).forEach((k) => { if (k && k.h) map.set(k.h, { h: k.h, n: k.n || '' }); });
+    const locals = staffEntries();
+    const localH = await Promise.all(locals.map((it) => it.h || sha256Hex(it.p)));
+    locals.forEach((it, i) => {
+      const h = localH[i];
+      if (!h) return;
+      const old = map.get(h);
+      map.set(h, { h, n: (it.n || (old && old.n) || '') });
+    });
+    const keys = [...map.values()];
+    await apiSync('/boss/staff-keys', { keys, allowEmpty: !!allowEmpty }, auth);
+    cloudStaffKeys = keys.slice();
+    cloudStaffHashes = keys.map((k) => k.h);
+    staffHashes = cloudStaffHashes.slice();
+    toast(msg || '员工密码已同步到云端，员工立即生效');
+  } catch (e) {
+    toast('云端同步员工密码失败：' + (e.message || e) + '（本机仍生效）');
+  }
+}
+
+/* ---------------------------------------------------------------- 每日商店按天失效 */
+/* 每天过凌晨 0 点，每日商店/夜市自动清空显示；账号、密码、邮箱、员工密码全部保留。
+   原始数据不真删（万一哪天忘了导入还能找回），只在显示层置空；导入新数据后自动覆盖。 */
+function dayKey(d) {
+  const t = d || new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate());
+}
+
+function setDataDate(v) {
+  dataDate = v || '';
+  try { localStorage.setItem(LS_DATA_DATE, dataDate); } catch (e) { /* 存不下就只在本会话生效 */ }
+}
+
+function isDataExpired() { return !!dataDate && dataDate !== dayKey(); }
+
+function maskRec(r) {
+  if (!r) return r;
+  if (!isDataExpired()) return r;
+  return {
+    id: r.id, pwd: r.pwd, email: r.email, emailPwd: r.emailPwd,
+    region: r.region, note: r.note, daily: [], night: [],
+  };
 }
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -364,7 +472,7 @@ function mergeRecords(incoming) {
   return { added, updated };
 }
 
-async function importFile(file) {
+async function importFile(file, resetSkins) {
   const ext = (file.name.split('.').pop() || '').toLowerCase();
   let records = [];
 
@@ -404,17 +512,25 @@ async function importFile(file) {
   }
 
   if (!records.length) throw new Error('没解析到账号，检查一下表头或列顺序');
+  /* 跨天导入：新表就是当天全量，直接整表替换（昨天的账号/皮肤一条不留） */
+  if (resetSkins) {
+    state.records = [];
+    state.shown = 0;
+  }
   return mergeRecords(records);
 }
 
 async function doImport(file) {
   if (state.role === 'staff') { toast('员工身份不能导入数据'); return; }
+  const newDay = dataDate !== dayKey();
   try {
-    const { added, updated } = await importFile(file);
+    const { added, updated } = await importFile(file, newDay);
+    setDataDate(dayKey());
     saveData();
     state.shown = 0;
     render();
     toast(`导入完成：新增 ${added} 个，更新 ${updated} 个`);
+    if (state.role === 'boss') await bossCloudUpload();
   } catch (e) {
     toast('导入失败：' + (e && e.message ? e.message : e));
   }
@@ -450,7 +566,8 @@ function saveData() {
 const SCOPE_LABEL = { all: '全部账号', has: '有每日商店', night: '有夜市', empty: '无皮肤数据' };
 
 function computeView() {
-  let arr = state.records.slice();
+  if (isDataExpired()) return [];   /* 过凌晨 0 点：整张列表清空（账号/密码/邮箱一起不显示），等新数据导入 */
+  let arr = state.records.map(maskRec);
   const q = state.q.trim().toLowerCase();
   if (q) {
     arr = arr.filter((r) =>
@@ -511,12 +628,27 @@ function cardHTML(r) {
 }
 
 function render(reset = true) {
+  const notice = $('#day-notice');
+  if (notice) {
+    const exp = isDataExpired();
+    notice.hidden = !exp;
+    if (exp) {
+      const d = dataDate.slice(5);
+      notice.innerHTML = `数据已过期（数据日期 <b>${esc(d)}</b>）—— 已过凌晨 0 点，数据已自动清空，等待今日数据导入。`;
+    }
+  }
   state.view = computeView();
   $('#total').textContent = state.view.length;
   const q = state.q.trim();
   $('#filter-label').textContent = '当前筛选：' + SCOPE_LABEL[state.scope] + (q ? ` · 搜索「${q}」` : '');
 
   const list = $('#list');
+  if (isDataExpired()) {
+    list.innerHTML = '<div class="day-empty">数据过期自动清除<br>等待新数据上传</div>';
+    $('#empty').style.display = 'none';
+    $('#more').hidden = true;
+    return;
+  }
   if (!state.records.length) {
     list.innerHTML = '';
     $('#empty').style.display = 'flex';
@@ -636,12 +768,14 @@ function bind() {
 
   $('#btn-clear').addEventListener('click', () => {
     if (!state.records.length) { toast('本来就没有数据'); return; }
-    if (!confirm(`确定清空 ${state.records.length} 条数据？只清浏览器里的，原始表格不受影响。`)) return;
+    if (!confirm(`危险操作！将删除全部 ${state.records.length} 个账号，员工立即看不到任何数据，且不可恢复。确定要清空吗？`)) return;
+    if (!confirm('再次确认：真的要清空全部数据吗？（这是最后一次确认）')) return;
     state.records = [];
     saveData();
     state.shown = 0;
     render();
     toast('已清空');
+    bossCloudUpload(true);
   });
 
   let qTimer;
@@ -659,8 +793,9 @@ function bind() {
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     const card = btn.closest('.card');
-    const rec = state.records.find((r) => r.id === card.dataset.id);
-    if (!rec) return;
+    const found = state.records.find((r) => r.id === card.dataset.id);
+    if (!found) return;
+    const rec = maskRec(found);
     const act = btn.dataset.act;
     if (act === 'view') { openShot(rec); return; }
     if (act === 'copy') {
@@ -714,7 +849,7 @@ function applyRoleUI() {
   const badge = $('#role-badge');
   badge.hidden = !state.role;
   if (state.role) {
-    badge.textContent = boss ? '老板' : '员工';
+    badge.textContent = boss ? '老板' : (staffName || '员工');
     badge.className = 'role-badge ' + (boss ? 'boss' : 'staff');
   }
   $('#btn-logout').hidden = !state.role;
@@ -724,23 +859,48 @@ function applyRoleUI() {
   $$('.boss-only').forEach((b) => { b.hidden = !boss; });
 }
 
-/* 员工：拉在线员工包（不含密码），并在本地再清一遍敏感字段 */
+/* 员工：优先拉云端最新员工包（不含密码），本地再清一遍敏感字段；云端不可达时退回静态文件 */
 async function syncStaff() {
   if (location.protocol === 'file:') return;
+  let j = null;
   try {
-    const res = await fetch('data-staff.json?_=' + Date.now(), { cache: 'no-store' });
-    if (!res.ok) return;
-    const j = await res.json();
-    if (Array.isArray(j.staffHashes) && j.staffHashes.length) staffHashes = j.staffHashes;
-    const arr = Array.isArray(j) ? j : (j.records || j.data || []);
-    const recs = parseJsonRecords(arr);
-    if (!recs.length) return;
-    mergeRecords(recs);
-    state.records.forEach((r) => { r.pwd = ''; r.email = ''; r.emailPwd = ''; });
-    saveData();
-    state.shown = 0;
-    render();
-  } catch (e) { /* 没有员工包就先用本地缓存 */ }
+    const r = await fetch('api/data/staff', { cache: 'no-store' });
+    if (r.ok) j = await r.json();
+  } catch (e) { /* 云端不可达 */ }
+  if (!j) {
+    try {
+      const r = await fetch('data-staff.json?_=' + Date.now(), { cache: 'no-store' });
+      if (r.ok) j = await r.json();
+    } catch (e) { /* 没有员工包就先用本地缓存 */ }
+  }
+  if (!j) return;
+  const arr = Array.isArray(j) ? j : (j.records || j.data || []);
+  const recs = parseJsonRecords(arr);
+  if (!recs.length) return;
+  const packDate = (!Array.isArray(j) && j && j.date) ? String(j.date) : '';
+  if (packDate && packDate !== dataDate) {
+    /* 云端已经是新一天的包：清掉本机昨天的商店数据，再合并 */
+    state.records.forEach((r) => { r.daily = []; r.night = []; });
+    setDataDate(packDate);
+  }
+  mergeRecords(recs);
+  state.records.forEach((r) => { r.pwd = ''; r.email = ''; r.emailPwd = ''; });
+  saveData();
+  state.shown = 0;
+  render();
+}
+
+/* 按密码哈希找备注：先查云端下发列表，再查老板本机清单 */
+async function staffNameFor(h) {
+  if (!h) return '';
+  const c = (cloudStaffKeys || []).find((k) => k && k.h === h);
+  if (c && c.n) return c.n;
+  const locals = staffEntries();
+  for (const it of locals) {
+    const ih = it.h || await sha256Hex(it.p);
+    if (ih === h) return it.n || '';
+  }
+  return c ? c.n || '' : '';
 }
 
 async function tryLogin(pass) {
@@ -752,28 +912,45 @@ async function tryLogin(pass) {
     void box.offsetWidth;
     box.classList.add('shake');
   };
-  /* 老板验证：能解开加密包的密码才是老板密码（代码里没有老板密码哈希，扒不走） */
+  /* 老板验证：能解开加密包的密码才是老板密码（代码里没有老板密码哈希，扒不走）
+     注意：清空数据后云端是空包（[]），解开也能成功 —— 只要解密没抛错就算老板，否则空包期老板会被当成密码错误 */
   let role = '';
   if (encPack) {
     try {
       const rows = await decryptPayload(pass, encPack);
+      role = 'boss';
       const arr = Array.isArray(rows) ? rows : (rows.records || []);
       const recs = parseJsonRecords(arr);
       if (recs.length) {
-        role = 'boss';
         const { added } = mergeRecords(recs);
         saveData();
+        if (!dataDate) setDataDate(cloudDataDate || dayKey()); /* 首次拿到的数据按云端包日期算，不清缓存也能正确判断过期 */
         if (added) toast(`在线数据已同步：新增 ${added} 个账号`);
       }
     } catch (e) { /* 解密失败 = 不是老板密码 */ }
   }
+  let loginHash = '';
   if (!role) {
     const h = await sha256Hex(pass);
+    loginHash = h;
     if (location.protocol === 'file:' && FILE_BOSS_HASH === h) role = 'boss';
     else if (staffHashes.includes(h) || staffLocalHashes.includes(h)) role = 'staff';
   }
   if (!role) { fail(); return; }
   err.textContent = '';
+  /* 员工：查出这个密码对应的备注，顶栏徽章直接显示名字 */
+  if (role === 'staff') {
+    staffName = await staffNameFor(loginHash);
+    if (staffName) sessionStorage.setItem(LS_STAFF_NAME, staffName);
+    else sessionStorage.removeItem(LS_STAFF_NAME);
+  } else {
+    staffName = '';
+    sessionStorage.removeItem(LS_STAFF_NAME);
+  }
+  /* 记住密码：勾选则存本机，下次自动登录；没勾就清掉旧记录 */
+  const rmb = $('#remember-pass');
+  if (rmb && rmb.checked) localStorage.setItem(LS_REMEMBER, pass);
+  else localStorage.removeItem(LS_REMEMBER);
   state.role = role;
   sessionStorage.setItem(LS_ROLE, role);
   if (role === 'boss') BOSS_PASS = pass;
@@ -807,7 +984,7 @@ function downloadJSON(name, obj) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 
-/* ---- 员工密码（老板本机管理，支持备注 / 修改 / 删除） ---- */
+/* ---- 员工密码（老板管理，支持备注 / 修改 / 删除，改动自动同步云端） ---- */
 let skEditing = -1; // 正在编辑的行号，-1 表示没有
 
 function staffEntries() {
@@ -816,8 +993,8 @@ function staffEntries() {
     if (Array.isArray(raw)) {
       return raw
         .map((it) => (typeof it === 'string'
-          ? { p: it, n: '' }
-          : { p: String(it && it.p || ''), n: String(it && it.n || '') }))
+          ? { p: it, n: '', h: '' }
+          : { p: String(it && it.p || ''), n: String(it && it.n || ''), h: String(it && it.h || '') }))
         .filter((it) => it.p);
     }
   } catch (e) { /* 忽略坏数据 */ }
@@ -829,14 +1006,22 @@ function saveStaffEntries(list) {
 async function refreshStaffHashes() {
   staffLocalHashes = await Promise.all(staffEntries().map((it) => sha256Hex(it.p)));
 }
-function renderStaffKeys() {
+async function renderStaffKeys() {
   const ul = $('#sk-list');
   const list = staffEntries();
-  if (!list.length) {
+  /* 补算缺失的哈希缓存（旧数据兼容），并写回 */
+  let dirty = false;
+  for (const it of list) {
+    if (!it.h) { it.h = await sha256Hex(it.p); dirty = true; }
+  }
+  if (dirty) saveStaffEntries(list);
+  const localHs = list.map((it) => it.h);
+  const cloudOnly = cloudStaffHashes.filter((h) => !localHs.includes(h));
+  if (!list.length && !cloudOnly.length) {
     ul.innerHTML = '<li class="sk-empty">还没有员工密码，员工现在无法登录</li>';
     return;
   }
-  ul.innerHTML = list.map((it, i) => {
+  const localRows = list.map((it, i) => {
     if (i === skEditing) {
       return `<li class="sk-row editing">
         <input class="sk-en" data-i="${i}" value="${esc(it.n)}" placeholder="备注" autocomplete="off">
@@ -853,13 +1038,22 @@ function renderStaffKeys() {
         <button class="sk-del" data-i="${i}">删除</button>
       </span>
     </li>`;
-  }).join('');
+  });
+  const cloudRows = cloudOnly.map((h) =>
+    `<li class="sk-row">
+      <span class="sk-name"><i class="sk-noname">云端密码（本机无明文）</i></span>
+      <b>${h.slice(0, 10)}…</b>
+      <span class="sk-ops">
+        <button class="sk-del" data-h="${h}">删除</button>
+      </span>
+    </li>`);
+  ul.innerHTML = localRows.join('') + cloudRows.join('');
   if (skEditing >= 0) {
     const inp = $('.sk-ep', ul);
     if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
   }
 }
-function addStaffPass() {
+async function addStaffPass() {
   const passInp = $('#sk-input');
   const noteInp = $('#sk-note');
   const p = passInp.value.trim();
@@ -867,38 +1061,54 @@ function addStaffPass() {
   if (!p) { toast('先输入密码再点添加'); return; }
   const list = staffEntries();
   if (list.some((it) => it.p === p)) { toast('这个密码已经存在'); return; }
-  list.push({ p, n });
+  const h = await sha256Hex(p);
+  if (!cloudStaffHashes.includes(h)) cloudStaffHashes.push(h);
+  list.push({ p, n, h });
   saveStaffEntries(list);
   passInp.value = '';
   noteInp.value = '';
   refreshStaffHashes();
   renderStaffKeys();
-  toast('已添加（本机立即生效，线上要重新导出发布）');
+  syncStaffKeysToCloud('已添加：本机生效，员工密码已同步云端，员工立即可用');
 }
-function editStaffPass(i, note, pass) {
+async function editStaffPass(i, note, pass) {
   const list = staffEntries();
   const cur = list[i];
   if (!cur) return;
   const p = (pass || '').trim();
   if (!p) { toast('密码不能为空'); return; }
   if (list.some((it, k) => k !== i && it.p === p)) { toast('这个密码和其他员工重复了'); return; }
-  list[i] = { p, n: (note || '').trim() };
+  const oldH = cur.h || (await sha256Hex(cur.p));
+  const newH = await sha256Hex(p);
+  /* 云端哈希列表同步更新：旧哈希移除、新哈希加入 */
+  cloudStaffHashes = cloudStaffHashes.filter((h) => h !== oldH);
+  if (!cloudStaffHashes.includes(newH)) cloudStaffHashes.push(newH);
+  list[i] = { p, n: (note || '').trim(), h: newH };
   saveStaffEntries(list);
   skEditing = -1;
   refreshStaffHashes();
   renderStaffKeys();
-  toast('已修改（外发要重新导出员工包）');
+  syncStaffKeysToCloud('已修改：旧密码立即失效，新密码立即生效（已同步云端）');
 }
-function delStaffPass(i) {
+async function delStaffPass(i) {
   const list = staffEntries();
   const it = list[i];
   if (!it) return;
+  const oldH = it.h || (await sha256Hex(it.p));
+  cloudStaffHashes = cloudStaffHashes.filter((h) => h !== oldH);
   list.splice(i, 1);
   saveStaffEntries(list);
   skEditing = -1;
   refreshStaffHashes();
   renderStaffKeys();
-  toast(`已删除${it.n ? ' ' + it.n : ''}，导出员工包重新发布后生效`);
+  syncStaffKeysToCloud(`已删除${it.n ? ' ' + it.n : ''}：该密码已同步云端立即失效`);
+}
+async function delCloudHash(h) {
+  cloudStaffHashes = cloudStaffHashes.filter((x) => x !== h);
+  cloudStaffKeys = (cloudStaffKeys || []).filter((k) => k.h !== h);
+  refreshStaffHashes();
+  renderStaffKeys();
+  syncStaffKeysToCloud('已删除云端密码：该密码立即失效');
 }
 
 function bindAuth() {
@@ -912,6 +1122,8 @@ function bindAuth() {
 
   $('#btn-logout').addEventListener('click', () => {
     sessionStorage.removeItem(LS_ROLE);
+    sessionStorage.removeItem(LS_STAFF_NAME);
+    localStorage.removeItem(LS_REMEMBER); /* 退出即清除记住的密码 */
     BOSS_PASS = '';
     location.reload();
   });
@@ -952,6 +1164,8 @@ function bindAuth() {
   $('#sk-list').addEventListener('click', (e) => {
     const t = e.target.closest('button');
     if (!t) return;
+    /* 云端哈希行（本机无明文）：按哈希删除 */
+    if (t.dataset.h) { delCloudHash(t.dataset.h); return; }
     const i = +t.dataset.i;
     if (t.classList.contains('sk-edit')) {
       skEditing = i;
@@ -974,11 +1188,18 @@ function bindAuth() {
     if (e.key === 'Escape') { skEditing = -1; renderStaffKeys(); }
   });
   $('#sk-restore').addEventListener('click', () => {
+    if (!confirm('危险操作！将删除全部员工密码，所有员工立即无法登录。确定要清空吗？')) return;
     localStorage.setItem(LS_STAFF_PASSES, JSON.stringify([]));
     skEditing = -1;
+    cloudStaffHashes = [];
+    cloudStaffKeys = [];
+    staffHashes = [];
     refreshStaffHashes();
     renderStaffKeys();
-    toast('已清空全部员工密码，导出员工包重新发布后员工将无法登录');
+    syncStaffKeysToCloud('已清空全部员工密码，并同步云端：所有员工立即无法登录', true);
+  });
+  $('#sk-sync').addEventListener('click', () => {
+    syncStaffKeysToCloud('已把本机员工密码全部同步到云端，员工立即可以登录');
   });
 }
 function rowsFromRecordsSkinOnly(list) {
@@ -992,30 +1213,77 @@ function rowsFromRecordsSkinOnly(list) {
 /* ---------------------------------------------------------------- 启动 */
 (async () => {
   state.records = loadData();
+  dataDate = localStorage.getItem(LS_DATA_DATE) || '';
+  if (!dataDate && state.records.length && location.protocol === 'file:') setDataDate(dayKey());
   bind();
   bindAuth();
   refreshStaffHashes();
-  /* 启动时拉在线数据包：加密包（验证老板密码 + 数据源）和员工包（员工密码哈希） */
+  /* 启动时：先拉云端配置（盐值 + 员工密码哈希），再拉最新加密数据包；静态文件作兜底 */
   if (location.protocol !== 'file:') {
     try {
-      const r1 = await fetch('data-enc.json?_=' + Date.now(), { cache: 'no-store' });
-      if (r1.ok) encPack = await r1.json();
-    } catch (e) { /* 没有在线包就只用本地数据 */ }
-    try {
-      const res = await fetch('data-staff.json?_=' + Date.now(), { cache: 'no-store' });
-      if (res.ok) {
-        const j = await res.json();
-        if (Array.isArray(j.staffHashes) && j.staffHashes.length) staffHashes = j.staffHashes;
+      const cfg = await apiSync('/config');
+      if (cfg.bossSalt) bossSalt = cfg.bossSalt;
+      if (cfg.dataUpdated) cloudDataDate = String(cfg.dataUpdated).slice(0, 10);
+      if (Array.isArray(cfg.staffKeys)) {
+        cloudStaffKeys = cfg.staffKeys
+          .filter((k) => k && typeof k.h === 'string')
+          .map((k) => ({ h: k.h, n: String(k.n || '') }));
       }
-    } catch (e) { /* 没有在线包就用默认（空）员工密码 */ }
+      if (Array.isArray(cfg.staffHashes)) {
+        cloudStaffHashes = cfg.staffHashes.slice();
+        staffHashes = cfg.staffHashes.slice();
+        if (!cloudStaffKeys.length) cloudStaffKeys = cloudStaffHashes.map((h) => ({ h, n: '' }));
+      }
+    } catch (e) { /* 云端不可达，退回静态包 */ }
+    if (!encPack) {
+      try { const r1 = await fetch('api/data/enc', { cache: 'no-store' }); if (r1.ok) encPack = await r1.json(); } catch (e) { /* 略 */ }
+    }
+    if (!encPack) {
+      try { const r1 = await fetch('data-enc.json?_=' + Date.now(), { cache: 'no-store' }); if (r1.ok) encPack = await r1.json(); } catch (e) { /* 没有在线包就只用本地数据 */ }
+    }
+    if (!dataDate && state.records.length) setDataDate(cloudDataDate || dayKey());
+    if (!staffHashes.length) {
+      try {
+        const res = await fetch('data-staff.json?_=' + Date.now(), { cache: 'no-store' });
+        if (res.ok) {
+          const j = await res.json();
+          if (Array.isArray(j.staffHashes) && j.staffHashes.length) staffHashes = j.staffHashes;
+        }
+      } catch (e) { /* 没有员工包就保持空（员工无法登录） */ }
+    }
   }
   state.role = sessionStorage.getItem(LS_ROLE) || '';
+  staffName = sessionStorage.getItem(LS_STAFF_NAME) || '';
   if (state.role) {
     applyRoleUI();
     $('#login-overlay').classList.add('hide');
     if (state.role === 'staff') await syncStaff();
     /* 老板刷新页面：密码不存盘，直接用本地缓存，不重新解密 */
+  } else {
+    /* 记住密码：本机存过密码就自动登录 */
+    const saved = localStorage.getItem(LS_REMEMBER) || '';
+    if (saved) {
+      const rmb = $('#remember-pass');
+      if (rmb) rmb.checked = true;
+      $('#login-pass').value = saved;
+      tryLogin(saved);
+    }
   }
   render();
   initSkinDB();
+  watchDayChange();
 })();
+
+/* 页面一直开着也要在过 0 点时自动清空：每 20 秒对一次日期，切回前台也查一次 */
+function watchDayChange() {
+  let cur = dayKey();
+  const tick = () => {
+    const now = dayKey();
+    if (now === cur) return;
+    cur = now;
+    render();
+    if (isDataExpired()) toast('已过凌晨 0 点：数据已自动清空，等今日数据导入');
+  };
+  setInterval(tick, 20000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+}

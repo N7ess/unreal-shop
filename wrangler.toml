@@ -1,0 +1,7 @@
+name = "unreal91"
+pages_build_output_dir = "."
+compatibility_date = "2026-01-01"
+
+[[kv_namespaces]]
+binding = "SHOP"
+id = "27c68230efae41238e9c0488f82f7a93"

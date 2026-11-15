@@ -98,6 +98,59 @@ def build(path):
         })
     return full, staff
 
+def merge_skins(full, staff):
+    """主表没有皮肤列时（如账密.xlsx 只有账号/密码/邮箱），从查询结果里按账号补皮肤/夜市/地区。"""
+    dirs = [p for p in DEFAULT_SOURCES if os.path.isdir(p)]
+    extra = {}
+    for d in dirs:
+        for p in sorted(glob.glob(os.path.join(d, "*.xlsx")), key=os.path.getmtime):
+            try:
+                rows = read_rows(p)
+            except Exception:
+                continue
+            rows = [r for r in rows if any(str(c).strip() for c in r)]
+            if len(rows) < 2:
+                continue
+            m = col_map([str(c).strip() for c in rows[0]])
+            if "skins" not in m:
+                continue
+            for r in rows[1:]:
+                acc = str(r[m["id"]] if "id" in m and m["id"] < len(r) else r[0]).strip()
+                if not acc:
+                    continue
+                def g(k):
+                    i = m.get(k)
+                    return "" if i is None or i >= len(r) else str(r[i]).strip()
+                rec = {"皮肤": g("skins"), "夜市": g("night"), "地区": g("region")}
+                cur = extra.get(acc.lower(), {})
+                for k, v in rec.items():
+                    if v:
+                        cur[k] = v
+                extra[acc.lower()] = cur
+    filled = 0
+    for rec in staff:
+        e = extra.get(str(rec["账号"]).lower())
+        if not e:
+            continue
+        changed = False
+        for k in ("皮肤", "夜市", "地区"):
+            if not rec.get(k) and e.get(k):
+                rec[k] = e[k]
+                changed = True
+        if changed:
+            filled += 1
+    pos = {str(s["账号"]).lower(): i for i, s in enumerate(staff)}
+    for rec in full:
+        i = pos.get(str(rec["账号"]).lower())
+        if i is None:
+            continue
+        for k in ("皮肤", "夜市", "地区"):
+            if not rec.get(k) and staff[i].get(k):
+                rec[k] = staff[i][k]
+    if filled:
+        print(f"已从查询结果补全 {filled} 个账号的皮肤/夜市/地区")
+    return full, staff
+
 def encrypt(obj, password):
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.primitives import hashes
@@ -127,6 +180,7 @@ def pick_source():
 def main():
     src = pick_source()
     full, staff = build(src)
+    full, staff = merge_skins(full, staff)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     enc = encrypt({"records": full, "updated": stamp}, BOSS_PASS)
     with open(os.path.join(SITE_DIR, "data-enc.json"), "w", encoding="utf-8") as f:
@@ -134,6 +188,7 @@ def main():
     with open(os.path.join(SITE_DIR, "data-staff.json"), "w", encoding="utf-8") as f:
         json.dump({
             "records": staff,
+            "date": datetime.date.today().isoformat(),  # 数据营业日：网页过凌晨 0 点自动清空每日商店，靠这个字段判断
             "updated": stamp,
             # 员工密码哈希由老板在网页「员工密码」里设置后点「导出员工包」生成，
             # 这里保持为空 = 员工密码未设置，员工无法登录
