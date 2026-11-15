@@ -90,7 +90,8 @@ async function syncAuthHex(pass) {
 }
 
 async function bossCloudUpload(allowEmpty) {
-  if (location.protocol === 'file:' || !bossSalt) return;
+  if (location.protocol === 'file:') { toast('这是本地文件，不会同步云端！请打开在线网址 unreal91.pages.dev 再上传'); return; }
+  if (!bossSalt) { toast('云端配置还没加载好，刷新页面后重试'); return; }
   if (!BOSS_PASS) { toast('请先退出登录，再用老板密码重新登录一次（刷新后密码不保留），才能同步云端'); return; }
   try {
     const auth = await syncAuthHex(BOSS_PASS);
@@ -109,7 +110,8 @@ async function bossCloudUpload(allowEmpty) {
 }
 
 async function syncStaffKeysToCloud(msg, allowEmpty) {
-  if (location.protocol === 'file:' || !bossSalt) return;
+  if (location.protocol === 'file:') { toast('这是本地文件，不会同步云端！请打开在线网址 unreal91.pages.dev 再操作'); return; }
+  if (!bossSalt) { toast('云端配置还没加载好，刷新页面后重试'); return; }
   if (!BOSS_PASS) { toast('请先退出登录，再用老板密码重新登录一次，员工密码才能同步到云端'); return; }
   try {
     const auth = await syncAuthHex(BOSS_PASS);
