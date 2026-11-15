@@ -862,8 +862,9 @@ function applyRoleUI() {
   $$('.boss-only').forEach((b) => { b.hidden = !boss; });
 }
 
-/* 员工：优先拉云端最新员工包（不含密码），本地再清一遍敏感字段；云端不可达时退回静态文件 */
-async function syncStaff() {
+/* 员工：优先拉云端最新员工包（不含密码），本地再清一遍敏感字段；云端不可达时退回静态文件
+   keepSecrets=true（老板设备自动跟随用）：合并时不清洗密码字段，老板本机的密码不丢 */
+async function syncStaff(keepSecrets) {
   if (location.protocol === 'file:') return;
   let j = null;
   try {
@@ -887,7 +888,7 @@ async function syncStaff() {
     setDataDate(packDate);
   }
   mergeRecords(recs);
-  state.records.forEach((r) => { r.pwd = ''; r.email = ''; r.emailPwd = ''; });
+  if (!keepSecrets) state.records.forEach((r) => { r.pwd = ''; r.email = ''; r.emailPwd = ''; });
   saveData();
   state.shown = 0;
   render();
@@ -1261,6 +1262,7 @@ function rowsFromRecordsSkinOnly(list) {
     applyRoleUI();
     $('#login-overlay').classList.add('hide');
     if (state.role === 'staff') await syncStaff();
+    else if (state.role === 'boss') await syncStaff(true); /* 老板刷新也拉一次云端，防止换设备/清缓存后看不到数据 */
     /* 老板刷新页面：密码不存盘，直接用本地缓存，不重新解密 */
   } else {
     /* 记住密码：本机存过密码就自动登录 */
@@ -1278,12 +1280,12 @@ function rowsFromRecordsSkinOnly(list) {
   watchCloudUpdate();
 })();
 
-/* 员工端自动跟随云端：每 30 秒 + 切回前台时查一次 dataUpdated，云端有新上传就自动拉最新数据，
-   已登录的设备不用重新登录、不用刷新页面 */
+/* 所有角色自动跟随云端：每 15 秒 + 切回前台 + 启动时查一次 dataUpdated，
+   云端有新上传就自动拉最新数据，已登录的设备不用重新登录、不用刷新页面 */
 function watchCloudUpdate() {
   if (location.protocol === 'file:') return;
   const check = async () => {
-    if (state.role !== 'staff') return;
+    if (state.role !== 'staff' && state.role !== 'boss') return;
     try {
       const r = await fetch('api/config', { cache: 'no-store' });
       if (!r.ok) return;
@@ -1291,14 +1293,15 @@ function watchCloudUpdate() {
       if (cfg.dataUpdated && cfg.dataUpdated !== lastSyncStamp) {
         lastSyncStamp = String(cfg.dataUpdated);
         if (cfg.dataUpdated) cloudDataDate = String(cfg.dataUpdated).slice(0, 10);
-        await syncStaff();
+        await syncStaff(state.role === 'boss'); /* 老板设备合并时不清洗密码 */
         state.shown = 0;
         render();
-        toast('老板已上传新数据，已自动同步最新');
+        toast('云端已上传新数据，本页已自动同步最新');
       }
     } catch (e) { /* 云端不可达，静默重试 */ }
   };
-  setInterval(check, 30000);
+  check();
+  setInterval(check, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
 }
 
